@@ -17,8 +17,8 @@ Sequoia-X V2 是面向 A 股市场的量化选股系统，基于现代 Python �
 ## 两种运行模式
 
 ```bash
-python main.py               # 日常模式：8进程增量补数据 + 跑策略 + 飞书推送（2~3分钟）
-python main.py --backfill     # 回填模式：全市场历史K线一次性灌入（约12分钟）
+uv run main.py               # 日常模式：8进程增量补数据 + 跑策略 + 飞书推送（2~3分钟）
+uv run main.py --backfill    # 回填模式：全市场历史K线一次性灌入（约12分钟）
 ```
 
 ---
@@ -43,15 +43,13 @@ python main.py --backfill     # 回填模式：全市场历史K线一次性灌�
 ### 环境要求
 
 - Python >= 3.10
+- [uv](https://docs.astral.sh/uv/)（极速 Python 包与虚拟环境管理器）
 
 ### 1. 安装依赖
 
 ```bash
-# 推荐使用 uv（快速包管理器）
+# 使用 uv 一键创建虚拟环境并同步所有依赖
 uv sync
-
-# 或者 pip
-pip install .
 ```
 
 ### 2. 配置环境变量
@@ -64,7 +62,7 @@ cp .env.example .env
 ### 3. 首次回填历史数据
 
 ```bash
-python main.py --backfill
+uv run main.py --backfill
 ```
 
 约 12 分钟完成 ~5200 只 A 股历史后复权日 K 数据回填。
@@ -72,13 +70,23 @@ python main.py --backfill
 ### 4. 日常运行
 
 ```bash
-python main.py
+uv run main.py
 ```
 
 建议配合 crontab 每个交易日收盘后自动执行：
 
 ```cron
-15 19 * * 1-5 cd /root/Sequoia-X && .venv/bin/python main.py >> log.txt 2>&1
+15 19 * * 1-5 cd /root/Sequoia-X && uv run main.py >> log.txt 2>&1
+```
+
+### 5. 策略选股预览与测试（可选）
+
+```bash
+# 控制台富文本表格快速预览 7 大策略选股结果
+uv run demo_preview.py
+
+# 运行自动化测试
+uv run pytest
 ```
 
 ---
