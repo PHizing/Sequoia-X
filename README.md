@@ -23,18 +23,25 @@ uv run main.py --backfill    # 回填模式：全市场历史K线一次性灌入
 
 ---
 
-## 内置策略 | Strategies
+## 策略与监控 | Strategies & Monitors
+
+### 1. 量化技术选股策略（基于本地历史日 K 向量化计算）
 
 | 策略 | 说明 |
 |---|---|
 | **TurtleTrade** | 海龟突破：20日新高 + 成交额过亿 + 阳线防诱多，按涨幅排序 |
+| **BollBreakout** | 布林通道突破：前期低波动带宽收口蓄势 + 当日放量向上穿透上轨 |
 | **MaVolume** | 均线+放量突破 |
 | **HighTightFlag** | 高而窄的旗形整理突破 |
 | **LimitUpShakeout** | 涨停洗盘回踩确认 |
 | **UptrendLimitDown** | 上升趋势中的跌停反包 |
 | **RpsBreakout** | 欧奈尔 RPS 相对强度突破 |
-| **BollBreakout** | 布林通道收口放量向上突破：低波动挤压蓄势 + 放量突破上轨 |
-| **PrivatePlacement** | 定向增发公告监控：跟踪近7日定增方案及核心要素 |
+
+### 2. 事件驱动与公告监控（基于外部接口实时抓取）
+
+| 模块 | 说明 |
+|---|---|
+| **PrivatePlacement** | 定向增发公告监控：跟踪近 7 天内最新发布的定向增发方案与发行公告 |
 
 ---
 
