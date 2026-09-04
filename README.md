@@ -33,6 +33,8 @@ python main.py --backfill     # 回填模式：全市场历史K线一次性灌�
 | **LimitUpShakeout** | 涨停洗盘回踩确认 |
 | **UptrendLimitDown** | 上升趋势中的跌停反包 |
 | **RpsBreakout** | 欧奈尔 RPS 相对强度突破 |
+| **BollBreakout** | 布林通道收口放量向上突破：低波动挤压蓄势 + 放量突破上轨 |
+| **PrivatePlacement** | 定向增发公告监控：跟踪近7日定增方案及核心要素 |
 
 ---
 
@@ -102,7 +104,9 @@ Sequoia-X/
 │   │   ├── high_tight_flag.py   # 高窄旗形策略
 │   │   ├── limit_up_shakeout.py # 涨停洗盘策略
 │   │   ├── uptrend_limit_down.py # 上升跌停策略
-│   │   └── rps_breakout.py      # RPS 突破策略
+│   │   ├── rps_breakout.py      # RPS 突破策略
+│   │   ├── boll_breakout.py     # 布林通道突破策略
+│   │   └── private_placement.py # 定增公告监控策略
 │   └── notify/
 │       └── feishu.py            # 飞书 Webhook 推送
 └── tests/                       # 属性测试（hypothesis）
