@@ -942,9 +942,9 @@ class HtmlReporter:
             const indicators = data.indicators;
             const stratName = data.strategy_name;
 
-            // Prepare series list
+            // Prepare series list and dynamic legend list in logical order
             const seriesList = [];
-            const legendData = ["K线", "成交量", "MA5", "MA10", "MA20", "MA60"];
+            const legendData = ["K线"];
 
             // 1. Candlestick series (Main Grid: 0)
             seriesList.push({{
@@ -994,9 +994,12 @@ class HtmlReporter:
 
             maConfigs.forEach(cfg => {{
                 if (indicators[cfg.key]) {{
+                    legendData.push(cfg.name);
                     seriesList.push({{
                         name: cfg.name,
                         type: "line",
+                        color: cfg.color,
+                        itemStyle: {{ color: cfg.color }},
                         data: indicators[cfg.key],
                         smooth: true,
                         showSymbol: false,
@@ -1014,6 +1017,8 @@ class HtmlReporter:
                     {{
                         name: "布林上轨",
                         type: "line",
+                        color: "#ff5252",
+                        itemStyle: {{ color: "#ff5252" }},
                         data: indicators["boll_upper"],
                         smooth: true,
                         showSymbol: false,
@@ -1024,6 +1029,8 @@ class HtmlReporter:
                     {{
                         name: "布林中轨",
                         type: "line",
+                        color: "#e0e0e0",
+                        itemStyle: {{ color: "#e0e0e0" }},
                         data: indicators["boll_mid"],
                         smooth: true,
                         showSymbol: false,
@@ -1034,6 +1041,8 @@ class HtmlReporter:
                     {{
                         name: "布林下轨",
                         type: "line",
+                        color: "#69f0ae",
+                        itemStyle: {{ color: "#69f0ae" }},
                         data: indicators["boll_lower"],
                         smooth: true,
                         showSymbol: false,
@@ -1047,6 +1056,8 @@ class HtmlReporter:
                 seriesList.push({{
                     name: "20日新高阻力线",
                     type: "line",
+                    color: "#ff9100",
+                    itemStyle: {{ color: "#ff9100" }},
                     data: indicators["turtle_high20"],
                     step: "end",
                     showSymbol: false,
@@ -1059,6 +1070,8 @@ class HtmlReporter:
                 seriesList.push({{
                     name: "120日平台高点",
                     type: "line",
+                    color: "#ff4081",
+                    itemStyle: {{ color: "#ff4081" }},
                     data: indicators["rps_high120"],
                     showSymbol: false,
                     xAxisIndex: 0,
@@ -1070,6 +1083,8 @@ class HtmlReporter:
                 seriesList.push({{
                     name: "昨收支撑线",
                     type: "line",
+                    color: "#00e676",
+                    itemStyle: {{ color: "#00e676" }},
                     data: indicators["prev_close"],
                     showSymbol: false,
                     xAxisIndex: 0,
@@ -1082,6 +1097,8 @@ class HtmlReporter:
                     {{
                         name: "40日旗杆顶",
                         type: "line",
+                        color: "#ffd700",
+                        itemStyle: {{ color: "#ffd700" }},
                         data: indicators["high40"],
                         showSymbol: false,
                         xAxisIndex: 0,
@@ -1091,6 +1108,8 @@ class HtmlReporter:
                     {{
                         name: "40日旗杆底",
                         type: "line",
+                        color: "#40c4ff",
+                        itemStyle: {{ color: "#40c4ff" }},
                         data: indicators["low40"],
                         showSymbol: false,
                         xAxisIndex: 0,
@@ -1101,9 +1120,14 @@ class HtmlReporter:
             }}
 
             // 4. Volume Bar series (Sub Grid: 1)
+            legendData.push("成交量");
             seriesList.push({{
                 name: "成交量",
                 type: "bar",
+                color: "#26a69a",
+                itemStyle: {{
+                    color: "#26a69a"
+                }},
                 xAxisIndex: 1,
                 yAxisIndex: 1,
                 data: volumes.map(v => ({{
@@ -1120,6 +1144,8 @@ class HtmlReporter:
                 seriesList.push({{
                     name: "Vol-MA20",
                     type: "line",
+                    color: "#ffb74d",
+                    itemStyle: {{ color: "#ffb74d" }},
                     xAxisIndex: 1,
                     yAxisIndex: 1,
                     data: indicators["vol_ma20"],
