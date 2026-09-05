@@ -17,7 +17,10 @@ ENV/
 .kiro
 
 # 数据库文件
-data/*.db
+/data/
+*.db
+*.db-shm
+*.db-wal
 
 # 环境变量
 .env
@@ -31,8 +34,12 @@ build/
 .pytest_cache/
 .ruff_cache/
 
-# 日志
+# 日志与临时文件
 *.log
+selection_report.md
 
 # Hypothesis 测试缓存
 .hypothesis/
+
+# 选股报告输出目录
+/reports/

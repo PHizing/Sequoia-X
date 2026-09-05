@@ -7,13 +7,14 @@
 
 import argparse
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
+
+_BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(_BASE_DIR / ".env")
 load_dotenv()
 
 from datetime import date
-
-import socket
-socket.setdefaulttimeout(10.0)
 
 from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
@@ -28,6 +29,7 @@ from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
 from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
 from sequoia_x.strategy.boll_breakout import BollBreakoutStrategy
+from sequoia_x.report.html_reporter import HtmlReporter
 
 
 def main() -> None:
@@ -58,6 +60,18 @@ def main() -> None:
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
+        # ── 检查本地历史数据：若完全无数据，自动从头执行全量回填 ──
+        local_symbols = engine.get_local_symbols()
+        if not local_symbols:
+            logger.warning("本地数据库尚无股票历史数据，策略计算需要历史K线支持。")
+            logger.info("自动启动全市场历史数据回填初始化（首次约需十几分钟）...")
+            all_symbols = engine.get_all_symbols()
+            if not all_symbols:
+                logger.error("获取股票代码列表失败，请检查网络后重试")
+                return
+            engine.backfill(all_symbols)
+            logger.info("历史数据初始化回填完成，继续执行日常增量与策略选股...")
+
         # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
         logger.info("开始拉取最新快照...")
         count = engine.sync_today_bulk()
@@ -76,6 +90,7 @@ def main() -> None:
         ]
 
         notifier = FeishuNotifier(settings)
+        strategy_results: dict[str, list[str]] = {}
 
         # 5. 遍历策略，有结果则推送至对应机器人
         for strategy in strategies:
@@ -83,6 +98,7 @@ def main() -> None:
             logger.info(f"执行策略：{strategy_name}")
 
             selected: list[str] = strategy.run()
+            strategy_results[strategy_name] = selected
             logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
 
             if selected:
@@ -93,6 +109,12 @@ def main() -> None:
                 )
             else:
                 logger.info(f"{strategy_name} 无选股结果，跳过推送")
+
+        # 6. Generate breakout visualization HTML report
+        logger.info("开始生成突破走势图 HTML 报告...")
+        reporter = HtmlReporter(engine=engine, settings=settings)
+        report_path = reporter.generate(strategy_results)
+        logger.info(f"选股走势报告已生成：{report_path}")
 
     except Exception:
         try:
