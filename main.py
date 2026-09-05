@@ -52,33 +52,46 @@ def main() -> None:
         # 3. 初始化数据引擎
         engine = DataEngine(settings)
 
-        # Synchronize stock basic metadata (symbols & Shenwan industry classification)
-        engine.sync_stock_basic()
+        # 3.1 同步全市场基础信息与上市/退市状态
+        logger.info("正在对齐全市场股票元数据与退市状态...")
+        new_symbols, delisted_symbols = engine.sync_stock_basic()
+        if new_symbols:
+            logger.info(f"本次发现 {len(new_symbols)} 只新上市股票: {new_symbols[:5]}{'...' if len(new_symbols) > 5 else ''}")
+        if delisted_symbols:
+            logger.info(f"本次更新 {len(delisted_symbols)} 只退市股票: {delisted_symbols[:5]}{'...' if len(delisted_symbols) > 5 else ''}")
 
         if args.backfill:
             # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
             logger.info("进入回填模式...")
-            all_symbols = engine.get_all_symbols()
-            engine.backfill(all_symbols)
+            active_symbols = engine.get_active_symbols()
+            engine.backfill(active_symbols)
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
-        # ── 检查本地历史数据：若完全无数据，自动从头执行全量回填 ──
-        local_symbols = engine.get_local_symbols()
+        # ── 检查本地历史数据 ──
+        local_symbols = set(engine.get_local_symbols())
+        active_symbols = engine.get_active_symbols()
+
         if not local_symbols:
             logger.warning("本地数据库尚无股票历史数据，策略计算需要历史K线支持。")
             logger.info("自动启动全市场历史数据回填初始化（首次约需十几分钟）...")
-            all_symbols = engine.get_all_symbols()
-            if not all_symbols:
+            if not active_symbols:
                 logger.error("获取股票代码列表失败，请检查网络后重试")
                 return
-            engine.backfill(all_symbols)
+            engine.backfill(active_symbols)
             logger.info("历史数据初始化回填完成，继续执行日常增量与策略选股...")
+        else:
+            # 3.2 自动检查在市但无历史K线的新股票并自动补齐
+            missing_symbols = [s for s in active_symbols if s not in local_symbols]
+            if missing_symbols:
+                logger.info(f"检测到 {len(missing_symbols)} 只在市但未建档的新增股票，自动执行历史数据回填...")
+                engine.backfill(missing_symbols)
+                logger.info("新增股票历史数据补齐完成")
 
         # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
         logger.info("开始拉取最新快照...")
         count = engine.sync_today_bulk()
-        logger.info(f"快照同步完成，写入 {count} 只股票")
+        logger.info(f"快照同步完成，写入 {count} 条日K行情")
 
         # 4. 策略列表（新增策略在此追加即可）
         strategies: list[BaseStrategy] = [

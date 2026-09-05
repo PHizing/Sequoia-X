@@ -31,13 +31,16 @@ class LimitUpShakeoutStrategy(BaseStrategy):
         Returns:
             满足条件的股票代码列表。
         """
-        symbols = self.engine.get_local_symbols()
+        symbols = self.engine.get_active_symbols()
+        latest_date = self.engine.get_market_latest_date()
         selected: list[str] = []
 
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
                 if len(df) < self._MIN_BARS:
+                    continue
+                if latest_date and str(df.iloc[-1]["date"]) != latest_date:
                     continue
 
                 # 取最近三根 K 线（向量化索引，无 iterrows）

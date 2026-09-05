@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS stock_basic (
     symbol       TEXT PRIMARY KEY,
     code         TEXT NOT NULL,
     name         TEXT NOT NULL,
+    status       INTEGER NOT NULL DEFAULT 1,
     industry_l1  TEXT,
     industry_l2  TEXT,
     updated_at   TEXT
@@ -43,6 +44,10 @@ CREATE TABLE IF NOT EXISTS stock_basic (
 
 _CREATE_BASIC_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_stock_basic_ind ON stock_basic (industry_l1, industry_l2);
+"""
+
+_CREATE_BASIC_STATUS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_stock_basic_status ON stock_basic (status);
 """
 
 
@@ -102,6 +107,7 @@ class DataEngine:
         self.db_path: str = str(db_p.resolve())
         self.start_date: str = settings.start_date
         self._basic_cache: dict[str, dict[str, str]] | None = None
+        self._synced_stock_basic: bool = False
         self._init_db()
 
     def _init_db(self) -> None:
@@ -113,6 +119,11 @@ class DataEngine:
             conn.execute(_CREATE_INDEX_SQL)
             conn.execute(_CREATE_BASIC_TABLE_SQL)
             conn.execute(_CREATE_BASIC_INDEX_SQL)
+            # Automatic schema migration: ensure 'status' column exists in stock_basic
+            cols = [col[1] for col in conn.execute("PRAGMA table_info(stock_basic)").fetchall()]
+            if "status" not in cols:
+                conn.execute("ALTER TABLE stock_basic ADD COLUMN status INTEGER NOT NULL DEFAULT 1")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_basic_status ON stock_basic (status)")
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -175,29 +186,33 @@ class DataEngine:
 
     # ── 数据同步 ──
 
-    def sync_stock_basic(self, force: bool = False) -> int:
-        """从 baostock / 申万行业分类服务同步股票基础信息与行业分类至 SQLite stock_basic 表。"""
+    def sync_stock_basic(self, force: bool = False) -> tuple[list[str], list[str]]:
+        """从 baostock / 申万行业分类服务同步股票基础信息与上市/退市状态至 SQLite stock_basic 表。
+        
+        Returns:
+            tuple[list[str], list[str]]: (新上市/新增股票代码列表 new_symbols, 退市股票代码列表 delisted_symbols)
+        """
+        if self._synced_stock_basic and not force:
+            return [], []
+
         from datetime import date
         from sequoia_x.data.sw_industry import ShenwanIndustryService
 
         today_str = date.today().strftime("%Y-%m-%d")
 
-        # 检查是否已有基础数据
         with sqlite3.connect(self.db_path) as conn:
-            count = conn.execute("SELECT COUNT(*) FROM stock_basic").fetchone()[0]
+            rows = conn.execute("SELECT symbol, status FROM stock_basic").fetchall()
+            existing_map: dict[str, int] = {r[0]: int(r[1]) for r in rows if r[1] is not None}
 
-        if count > 0 and not force:
-            logger.info(f"本地 stock_basic 已收录 {count} 只股票，跳过基础表同步")
-            return count
-
-        logger.info("开始同步全市场股票基础信息与申万一二级行业分类...")
+        logger.info("开始同步全市场股票基础信息、申万行业分类及退市状态...")
         import contextlib
         import io
         import socket
         socket.setdefaulttimeout(15.0)
         import baostock as bs
 
-        records = []
+        # Mapping: {sym: (code, name, status)}
+        online_stocks: dict[str, tuple[str, str, int]] = {}
         with contextlib.redirect_stdout(io.StringIO()):
             try:
                 lg = bs.login()
@@ -207,12 +222,12 @@ class DataEngine:
                         row = rs.get_row_data()
                         code = row[0]        # e.g. "sh.600000"
                         name = row[1]        # e.g. "浦发银行"
-                        status = row[4]      # "1" = Listed
+                        status_str = row[4]  # "1" = Listed, "0" = Delisted
                         stock_type = row[5]  # "1" = Stock
-                        if status == "1" and stock_type == "1":
+                        if stock_type == "1" and "." in code:
                             sym = code.split(".")[1]
-                            l1, l2 = ShenwanIndustryService.get_industry(sym)
-                            records.append((sym, code, name, l1, l2, today_str))
+                            status = 1 if status_str == "1" else 0
+                            online_stocks[sym] = (code, name, status)
             except Exception as exc:
                 logger.warning(f"baostock 同步股票基础信息异常: {exc}")
             finally:
@@ -221,8 +236,8 @@ class DataEngine:
                 except Exception:
                     pass
 
-        # 3. 若 baostock 失败，通过 akshare 兜底
-        if not records:
+        # 若 baostock 失败且本地为空，通过 akshare 兜底
+        if not online_stocks and not existing_map:
             logger.warning("baostock 获取股票列表失败，尝试通过 akshare 兜底同步 stock_basic...")
             try:
                 import akshare as ak
@@ -232,32 +247,62 @@ class DataEngine:
                         sym = str(row["code"]).zfill(6)
                         name = str(row["name"])
                         code = self._to_baostock_code(sym)
-                        l1, l2 = ShenwanIndustryService.get_industry(sym)
-                        records.append((sym, code, name, l1, l2, today_str))
+                        online_stocks[sym] = (code, name, 1)
             except Exception as e_ak:
                 logger.error(f"akshare 兜底获取股票基础信息失败: {e_ak}")
 
-        if records:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.executemany(
-                    """
-                    INSERT INTO stock_basic (symbol, code, name, industry_l1, industry_l2, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(symbol) DO UPDATE SET
-                        code = excluded.code,
-                        name = excluded.name,
-                        industry_l1 = excluded.industry_l1,
-                        industry_l2 = excluded.industry_l2,
-                        updated_at = excluded.updated_at
-                    """,
-                    records,
-                )
-                conn.commit()
-            logger.info(f"stock_basic 基础信息同步完成，写入/更新 {len(records)} 只股票")
-            self._basic_cache = None
-            return len(records)
+        new_symbols: list[str] = []
+        delisted_symbols: list[str] = []
 
-        return 0
+        if online_stocks:
+            new_records = []
+            status_updates = []
+
+            for sym, (code, name, status) in online_stocks.items():
+                if sym not in existing_map:
+                    # 发现新股票（仅记录在市股票，退市的首次不纳入新股票列表）
+                    l1, l2 = ShenwanIndustryService.get_industry(sym)
+                    new_records.append((sym, code, name, status, l1, l2, today_str))
+                    if status == 1:
+                        new_symbols.append(sym)
+                else:
+                    old_status = existing_map[sym]
+                    if old_status != status:
+                        if status == 0:
+                            delisted_symbols.append(sym)
+                        status_updates.append((status, today_str, sym))
+
+            with sqlite3.connect(self.db_path) as conn:
+                if new_records:
+                    conn.executemany(
+                        """
+                        INSERT INTO stock_basic (symbol, code, name, status, industry_l1, industry_l2, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol) DO UPDATE SET
+                            code = excluded.code,
+                            name = excluded.name,
+                            status = excluded.status,
+                            industry_l1 = coalesce(excluded.industry_l1, stock_basic.industry_l1),
+                            industry_l2 = coalesce(excluded.industry_l2, stock_basic.industry_l2),
+                            updated_at = excluded.updated_at
+                        """,
+                        new_records,
+                    )
+                if status_updates:
+                    conn.executemany(
+                        "UPDATE stock_basic SET status = ?, updated_at = ? WHERE symbol = ?",
+                        status_updates,
+                    )
+                conn.commit()
+
+            logger.info(
+                f"stock_basic 同步完成：新增 {len(new_records)} 只股票，"
+                f"更新状态 {len(status_updates)} 只（其中退市 {len(delisted_symbols)} 只）"
+            )
+            self._basic_cache = None
+
+        self._synced_stock_basic = True
+        return new_symbols, delisted_symbols
 
     def get_stock_basic_map(self) -> dict[str, dict[str, str]]:
         """获取所有股票的基础信息映射字典：{symbol: {"name": ..., "industry_l1": ..., "industry_l2": ...}}。"""
@@ -287,12 +332,44 @@ class DataEngine:
         self._basic_cache = mapping
         return mapping
 
+    def get_active_symbols(self) -> list[str]:
+        """获取全市场在市 A 股代码列表 (status = 1)。"""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT symbol FROM stock_basic WHERE status = 1 ORDER BY symbol"
+            ).fetchall()
+        if rows:
+            return [row[0] for row in rows]
+
+        self.sync_stock_basic()
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT symbol FROM stock_basic WHERE status = 1 ORDER BY symbol"
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def get_market_latest_date(self) -> str | None:
+        """获取本地数据库中在市股票的最新收盘交易日期。"""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT MAX(d.date)
+                FROM stock_daily d
+                JOIN stock_basic b ON d.symbol = b.symbol
+                WHERE b.status = 1
+                """
+            ).fetchone()
+            if row and row[0]:
+                return row[0]
+            # 降级直接从 stock_daily 获取
+            row2 = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()
+            return row2[0] if row2 and row2[0] else None
+
     def sync_today_bulk(self) -> int:
-        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。
+        """多进程并行通过 baostock 拉取在市股票增量数据（后复权），安全写入 SQLite。
         
-        自动对比 stock_basic 与 stock_daily：
-        - 已有股票：增量同步自最新日期后的数据；
-        - 新上市或本地缺失股票：自动从 start_date 拉取数据补齐。
+        仅拉取在市股票 (status = 1)，彻底排除退市股票。
+        使用 INSERT OR REPLACE 针对 (symbol, date) 进行幂等追加，绝不删除历史日K线。
         """
         from datetime import date, timedelta
         from multiprocessing import Pool
@@ -300,43 +377,39 @@ class DataEngine:
         today = date.today()
         today_str = today.strftime("%Y-%m-%d")
 
-        # 确保基础信息表已同步，获取全市场股票
+        # 确保基础信息表已同步
         self.sync_stock_basic()
 
-        tasks = []
+        target_symbols = self.get_active_symbols()
+        if not target_symbols:
+            logger.warning("在市股票列表为空，请先执行基础数据同步")
+            return 0
+
         with sqlite3.connect(self.db_path) as conn:
             daily_rows = conn.execute(
                 "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
             ).fetchall()
-            basic_symbols = [
-                r[0] for r in conn.execute("SELECT symbol FROM stock_basic ORDER BY symbol").fetchall()
-            ]
-
-        if not daily_rows and not basic_symbols:
-            logger.warning("本地无股票数据，请先执行 --backfill")
-            return 0
 
         daily_map = dict(daily_rows)
-        all_target_symbols = basic_symbols if basic_symbols else list(daily_map.keys())
 
-        for symbol in all_target_symbols:
+        tasks = []
+        for symbol in target_symbols:
             last_date = daily_map.get(symbol)
             if last_date and last_date >= today_str:
                 continue
             if last_date:
                 start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
             else:
-                # 新股票或未入库股票，从配置的起始日期开始同步
+                # 缺失历史的股票，从配置的起始日期开始同步
                 start = self.start_date
             tasks.append((symbol, self._to_baostock_code(symbol), start, today_str))
 
         if not tasks:
-            logger.info("所有股票已是最新，无需更新")
+            logger.info("所有在市股票已是最新，无需更新")
             return 0
 
-        # 计算本地市场最新收盘日期
-        max_dates = [last_date for _, last_date in daily_rows if last_date]
-        market_latest_date = max(max_dates) if max_dates else None
+        # 计算本地市场在市股票最新收盘日期
+        market_latest_date = self.get_market_latest_date()
 
         # 如果今天是周末，计算最近的周五
         if today.weekday() == 5:
@@ -346,7 +419,7 @@ class DataEngine:
         else:
             last_trading_day = today_str
 
-        # 1. 若当前是周末且本地已有股票收录最近周五的数据，且没有新增待补新股票，则无需重复同步
+        # 1. 若当前是周末且本地已有股票收录最近周五的数据，且没有新增待补股票，则无需重复同步
         has_new_stocks = any(symbol not in daily_map for symbol, _, _, _ in tasks)
         if not has_new_stocks and today.weekday() >= 5 and market_latest_date and market_latest_date >= last_trading_day:
             logger.info(f"今日 ({today_str}) 为周末休市日，本地已收录周五最新数据 ({market_latest_date})，无需增量同步")
@@ -359,7 +432,7 @@ class DataEngine:
                 logger.info(f"今日 ({today_str}) 行情尚未发布或为休市日，跳过增量更新，直接使用已有最新数据 ({market_latest_date})")
                 return 0
 
-        logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
+        logger.info(f"需要更新 {len(tasks)} 只在市股票，启动多进程并行拉取...")
 
         n_workers = min(4, len(tasks))
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
@@ -382,13 +455,37 @@ class DataEngine:
         df = df[df["volume"] > 0]
 
         count = len(df)
+        if count == 0:
+            return 0
+
+        # 安全写入：采用 INSERT OR REPLACE，按照 (symbol, date) 唯一键无损覆写，绝对不执行全局日期 DELETE
+        insert_sql = """
+        INSERT OR REPLACE INTO stock_daily (symbol, date, open, high, low, close, volume, turnover)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        records_to_insert = [
+            (
+                row["symbol"],
+                row["date"],
+                row["open"],
+                row["high"],
+                row["low"],
+                row["close"],
+                row["volume"],
+                row["turnover"],
+            )
+            for _, row in df.iterrows()
+        ]
+
         with sqlite3.connect(self.db_path) as conn:
-            for d in df["date"].unique().tolist():
-                conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
-            df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("PRAGMA journal_mode = WAL")
+            batch_size = 1000
+            for i in range(0, len(records_to_insert), batch_size):
+                conn.executemany(insert_sql, records_to_insert[i : i + batch_size])
             conn.commit()
 
-        logger.info(f"sync_today_bulk: 写入 {count} 条数据")
+        logger.info(f"sync_today_bulk: 安全写入 {count} 条日K行情数据")
         return count
 
     def backfill(self, symbols: list[str]) -> None:
@@ -594,73 +691,8 @@ class DataEngine:
     # ── 股票列表 ──
 
     def get_all_symbols(self) -> list[str]:
-        """获取全市场 A 股代码列表（优先读取本地 stock_basic，未就绪则自动同步）。"""
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT symbol FROM stock_basic ORDER BY symbol"
-            ).fetchall()
-        if rows:
-            return [row[0] for row in rows]
-
-        # 尝试自动同步 stock_basic
-        self.sync_stock_basic()
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT symbol FROM stock_basic ORDER BY symbol"
-            ).fetchall()
-        if rows:
-            return [row[0] for row in rows]
-
-        import socket
-        socket.setdefaulttimeout(15.0)
-        import time
-        import baostock as bs
-
-        max_retries = 3
-        symbols: list[str] = []
-
-        # 1. Attempt to fetch from baostock with retries
-        for attempt in range(max_retries):
-            lg = bs.login()
-            if lg.error_code != "0":
-                logger.warning(f"baostock 登录失败 (第{attempt + 1}次): {lg.error_msg}")
-                time.sleep(1)
-                continue
-
-            try:
-                rs = bs.query_stock_basic(code_name="", code="")
-                symbols = []
-                while rs.next():
-                    row = rs.get_row_data()
-                    code = row[0]           # e.g. "sh.600000" or "sz.000001"
-                    status = row[4]         # "1" = Listed
-                    stock_type = row[5]     # "1" = Stock
-                    if status == "1" and stock_type == "1":
-                        symbols.append(code.split(".")[1])  # Extract numeric code
-                if symbols:
-                    logger.info(f"获取股票列表完成 (baostock)，共 {len(symbols)} 只")
-                    return symbols
-            except Exception as e:
-                logger.warning(f"baostock 获取股票列表第{attempt + 1}次异常: {e}")
-            finally:
-                bs.logout()
-
-            time.sleep(2 ** attempt)
-
-        # 2. Fallback to akshare if baostock fails
-        logger.warning("baostock 获取股票列表失败或为空，尝试通过 akshare 兜底获取...")
-        try:
-            import akshare as ak
-
-            stock_info = ak.stock_info_a_code_name()
-            if stock_info is not None and not stock_info.empty and "code" in stock_info.columns:
-                symbols = [str(c).zfill(6) for c in stock_info["code"].dropna().tolist()]
-                logger.info(f"通过 akshare 兜底获取股票列表完成，共 {len(symbols)} 只")
-                return symbols
-        except Exception as exc:
-            logger.error(f"akshare 兜底获取股票列表也失败: {exc}")
-
-        return symbols
+        """获取全市场在市 A 股代码列表 (status = 1)。"""
+        return self.get_active_symbols()
 
     def get_local_symbols(self) -> list[str]:
         with sqlite3.connect(self.db_path) as conn:

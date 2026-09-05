@@ -38,13 +38,16 @@ class BollBreakoutStrategy(BaseStrategy):
 
     def run(self) -> list[str]:
         """遍历本地数据库股票，返回满足布林带收口突破条件的股票代码列表。"""
-        symbols = self.engine.get_local_symbols()
+        symbols = self.engine.get_active_symbols()
+        latest_date = self.engine.get_market_latest_date()
         selected: list[str] = []
 
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
                 if len(df) < self._MIN_BARS:
+                    continue
+                if latest_date and str(df.iloc[-1]["date"]) != latest_date:
                     continue
 
                 # 向量化计算布林带与成交量均线

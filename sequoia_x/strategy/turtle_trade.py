@@ -68,13 +68,16 @@ class TurtleTradeStrategy(BaseStrategy):
         """
         遍历全市场，返回满足海龟突破条件的股票代码列表。
         """
-        symbols = self.engine.get_local_symbols()
+        symbols = self.engine.get_active_symbols()
+        latest_date = self.engine.get_market_latest_date()
         candidates: list[str] = []
 
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
                 if len(df) < self._MIN_BARS:
+                    continue
+                if latest_date and str(df.iloc[-1]["date"]) != latest_date:
                     continue
 
                 # 向量化：前20日 high 的滚动最大值（不含当日，shift(1) 后取 rolling(20)）
