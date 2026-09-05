@@ -100,6 +100,8 @@ class HtmlReporter:
         symbol: str,
         name: str,
         strategy_name: str,
+        industry_l1: str = "其他",
+        industry_l2: str = "其他",
     ) -> dict[str, Any] | None:
         """
         Fetch OHLCV data for a symbol and calculate strategy-specific indicator series.
@@ -135,6 +137,10 @@ class HtmlReporter:
         elif strategy_name == "HighTightFlagStrategy":
             df["high40"] = df["high"].rolling(40, min_periods=20).max()
             df["low40"] = df["low"].rolling(40, min_periods=20).min()
+
+        # Keep the latest 200 bars for optimal chart rendering and compact report size
+        if len(df) > 200:
+            df = df.iloc[-200:].reset_index(drop=True)
 
         # Build candle values: [open, close, low, high] (ECharts standard)
         dates = df["date"].astype(str).tolist()
@@ -202,6 +208,8 @@ class HtmlReporter:
             "elem_id": elem_id,
             "symbol": symbol,
             "name": name,
+            "industry_l1": industry_l1,
+            "industry_l2": industry_l2,
             "xq_code": xq_code,
             "strategy_name": strategy_name,
             "dates": dates,
@@ -258,12 +266,35 @@ class HtmlReporter:
         for symbols in strategy_results.values():
             all_symbols.update(symbols)
 
-        name_map: dict[str, str] = {}
-        if all_symbols:
+        # Collect basic info (name, industry_l1, industry_l2) in bulk from DataEngine
+        basic_map: dict[str, dict[str, str]] = {}
+        try:
+            res = self.engine.get_stock_basic_map()
+            if isinstance(res, dict):
+                basic_map = res
+        except Exception as exc:
+            logger.warning(f"从数据引擎获取基础信息失败: {exc}")
+
+        # Fallback to FeishuNotifier if basic_map is empty
+        if not basic_map and all_symbols:
             try:
-                name_map = FeishuNotifier._get_stock_names(list(all_symbols))
+                name_only = FeishuNotifier._get_stock_names(list(all_symbols), db_path=self.settings.db_path)
+                basic_map = {
+                    s: {"name": str(n), "industry_l1": "其他", "industry_l2": "其他"}
+                    for s, n in name_only.items()
+                }
             except Exception as exc:
                 logger.warning(f"获取股票中文名称失败，使用代码代替：{exc}")
+
+        def _safe_info(sym: str) -> tuple[str, str, str]:
+            info = basic_map.get(sym, {}) if isinstance(basic_map, dict) else {}
+            if not isinstance(info, dict):
+                info = {}
+            nm = info.get("name")
+            name_val = str(nm) if nm is not None else sym
+            l1_val = str(info.get("industry_l1") or "其他")
+            l2_val = str(info.get("industry_l2") or "其他")
+            return name_val, l1_val, l2_val
 
         # Segregate technical breakout charts and event announcements
         technical_sections: list[dict[str, Any]] = []
@@ -290,11 +321,13 @@ class HtmlReporter:
                 # Render as structured table card for announcements
                 records = []
                 for s in symbols:
-                    name = name_map.get(s, s)
+                    name, ind_l1, ind_l2 = _safe_info(s)
                     xq_code = FeishuNotifier._to_xueqiu_code(s)
                     records.append({
                         "symbol": s,
                         "name": name,
+                        "industry_l1": ind_l1,
+                        "industry_l2": ind_l2,
                         "xq_code": xq_code,
                         "xq_url": f"https://xueqiu.com/S/{xq_code}",
                     })
@@ -308,8 +341,14 @@ class HtmlReporter:
                 # Render as interactive K-line charts
                 charts = []
                 for s in symbols:
-                    name = name_map.get(s, s)
-                    chart_data = self._extract_stock_chart_data(s, name, strat_name)
+                    name, ind_l1, ind_l2 = _safe_info(s)
+                    chart_data = self._extract_stock_chart_data(
+                        symbol=s,
+                        name=name,
+                        strategy_name=strat_name,
+                        industry_l1=ind_l1,
+                        industry_l2=ind_l2,
+                    )
                     if chart_data:
                         charts.append(chart_data)
                 
@@ -348,6 +387,30 @@ class HtmlReporter:
         generated_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         db_path = self.settings.db_path
 
+        # Inline local bundled ECharts if available for 100% self-contained offline reports
+        echarts_script_tag = ""
+        local_asset = Path(__file__).resolve().parent / "assets" / "echarts.min.js"
+        if local_asset.exists():
+            try:
+                echarts_min_js = local_asset.read_text(encoding="utf-8")
+                echarts_script_tag = f"<!-- Apache ECharts (bundled echarts.min.js) -->\n<script>\n{echarts_min_js}\n</script>"
+            except Exception as exc:
+                logger.warning(f"读取内置 ECharts 静态资源失败，降级为外部引用: {exc}")
+
+        if not echarts_script_tag:
+            echarts_script_tag = """    <!-- Apache ECharts (Local bundled asset with multi-CDN fallback) -->
+    <script src="assets/echarts.min.js"></script>
+    <script>
+        if (!window.echarts) {
+            document.write('<script src="https://registry.npmmirror.com/echarts/5.5.0/files/dist/echarts.min.js"><\\/script>');
+        }
+    </script>
+    <script>
+        if (!window.echarts) {
+            document.write('<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"><\\/script>');
+        }
+    </script>"""
+
         # JSON data for charts injection (with compact separators)
         charts_payload: list[dict[str, Any]] = []
         for sec in technical_sections:
@@ -355,6 +418,55 @@ class HtmlReporter:
                 charts_payload.append(c)
 
         charts_json_str = json.dumps(charts_payload, ensure_ascii=False, separators=(",", ":"))
+
+        # Collect Shenwan industry distribution from hit stocks
+        seen_stocks_l1: dict[str, set[str]] = {}
+        seen_stocks_l2: dict[str, dict[str, set[str]]] = {}
+
+        for sec in technical_sections:
+            for c in sec["charts"]:
+                sym = c["symbol"]
+                l1 = c.get("industry_l1") or "其他"
+                l2 = c.get("industry_l2") or "其他"
+                seen_stocks_l1.setdefault(l1, set()).add(sym)
+                seen_stocks_l2.setdefault(l1, {}).setdefault(l2, set()).add(sym)
+
+        for sec in event_sections:
+            for r in sec["records"]:
+                sym = r["symbol"]
+                l1 = r.get("industry_l1") or "其他"
+                l2 = r.get("industry_l2") or "其他"
+                seen_stocks_l1.setdefault(l1, set()).add(sym)
+                seen_stocks_l2.setdefault(l1, {}).setdefault(l2, set()).add(sym)
+
+        # Build industry hierarchy map: {l1: {l2: stock_count}}
+        industry_tree: dict[str, dict[str, int]] = {
+            l1: {l2: len(stocks) for l2, stocks in l2_dict.items()}
+            for l1, l2_dict in seen_stocks_l2.items()
+        }
+        industry_tree_json = json.dumps(industry_tree, ensure_ascii=False, separators=(",", ":"))
+
+        # Calculate unique hit stocks
+        all_hit_symbols = set().union(*seen_stocks_l1.values()) if seen_stocks_l1 else set()
+        total_unique_stocks = len(all_hit_symbols)
+
+        # Sort L1 industries by stock count descending
+        sorted_l1 = sorted(
+            seen_stocks_l1.items(),
+            key=lambda item: len(item[1]),
+            reverse=True,
+        )
+
+        l1_chips_html = [
+            f'<button type="button" class="filter-chip active" data-level="l1" data-val="ALL" onclick="handleL1Filter(\'ALL\', this)">'
+            f'全部 <span class="chip-count">{total_unique_stocks}</span></button>'
+        ]
+        for l1_name, stks in sorted_l1:
+            l1_chips_html.append(
+                f'<button type="button" class="filter-chip" data-level="l1" data-val="{l1_name}" onclick="handleL1Filter(\'{l1_name}\', this)">'
+                f'{l1_name} <span class="chip-count">{len(stks)}</span></button>'
+            )
+        l1_chips_str = "\n".join(l1_chips_html)
 
         # Build navigation items
         nav_items_html = []
@@ -394,13 +506,16 @@ class HtmlReporter:
                 chart_elem_id = chart["elem_id"]
                 pct_cls = "up-color" if chart["pct_change"] >= 0 else "down-color"
                 pct_sign = "+" if chart["pct_change"] >= 0 else ""
+                ind_l1 = chart.get("industry_l1", "其他")
+                ind_l2 = chart.get("industry_l2", "其他")
 
                 card = f"""
-                <div class="stock-card">
+                <div class="stock-card" data-industry-l1="{ind_l1}" data-industry-l2="{ind_l2}">
                     <div class="card-header">
                         <div class="header-left">
                             <span class="stock-name">{chart['name']}</span>
                             <span class="stock-code">{chart['symbol']}</span>
+                            <span class="badge-industry" title="申万二级行业">{ind_l1} · {ind_l2}</span>
                             <a href="https://xueqiu.com/S/{chart['xq_code']}" target="_blank" class="xq-link" title="在雪球中查看行情">雪球 ↗</a>
                         </div>
                         <div class="header-right">
@@ -439,11 +554,14 @@ class HtmlReporter:
 
             rows_html = []
             for r in records:
+                ind_l1 = r.get("industry_l1", "其他")
+                ind_l2 = r.get("industry_l2", "其他")
                 rows_html.append(f"""
-                <tr>
+                <tr data-industry-l1="{ind_l1}" data-industry-l2="{ind_l2}">
                     <td><strong>{r['name']}</strong></td>
                     <td><code>{r['symbol']}</code></td>
                     <td><span class="badge-tag">定向增发</span></td>
+                    <td><span class="badge-industry">{ind_l1} · {ind_l2}</span></td>
                     <td><a href="{r['xq_url']}" target="_blank" class="xq-table-link">雪球行情 ↗</a></td>
                 </tr>
                 """)
@@ -465,6 +583,7 @@ class HtmlReporter:
                                 <th>股票名称</th>
                                 <th>股票代码</th>
                                 <th>事件类型</th>
+                                <th>申万行业</th>
                                 <th>行情链接</th>
                             </tr>
                         </thead>
@@ -491,18 +610,8 @@ class HtmlReporter:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Sequoia-X 量化突破走势图报告 | {date.today().strftime('%Y-%m-%d')}</title>
-    <!-- Apache ECharts (Local bundled asset with multi-CDN fallback) -->
-    <script src="assets/echarts.min.js"></script>
-    <script>
-        if (!window.echarts) {{
-            document.write('<script src="https://registry.npmmirror.com/echarts/5.5.0/files/dist/echarts.min.js"><\\/script>');
-        }}
-    </script>
-    <script>
-        if (!window.echarts) {{
-            document.write('<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"><\\/script>');
-        }}
-    </script>
+    <!-- Apache ECharts -->
+    {echarts_script_tag}
     <style>
         :root {{
             --bg-body: #101216;
@@ -825,6 +934,100 @@ class HtmlReporter:
             font-size: 13px;
         }}
 
+        .badge-industry {{
+            display: inline-flex;
+            align-items: center;
+            background: rgba(139, 92, 246, 0.15);
+            color: #c4b5fd;
+            border: 1px solid rgba(139, 92, 246, 0.35);
+            font-size: 12px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-weight: 500;
+        }}
+
+        /* Industry Filter Controls */
+        .filter-divider {{
+            border-top: 1px dashed var(--border-color);
+            margin: 16px 0 14px 0;
+        }}
+
+        .filter-container {{
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }}
+
+        .filter-group {{
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            flex-wrap: wrap;
+        }}
+
+        .filter-label {{
+            font-size: 13px;
+            color: var(--text-dim);
+            min-width: 90px;
+            padding-top: 5px;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }}
+
+        .filter-chips {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            flex: 1;
+        }}
+
+        .filter-chip {{
+            background: #212631;
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 5px 12px;
+            border-radius: 16px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            user-select: none;
+            outline: none;
+        }}
+
+        .filter-chip:hover {{
+            background: #2b3242;
+            border-color: var(--color-accent);
+            color: #ffffff;
+            transform: translateY(-1px);
+        }}
+
+        .filter-chip.active {{
+            background: rgba(56, 139, 253, 0.22);
+            border-color: var(--color-accent);
+            color: #79c0ff;
+            font-weight: 600;
+            box-shadow: 0 0 10px rgba(56, 139, 253, 0.3);
+        }}
+
+        .chip-count {{
+            background: rgba(255, 255, 255, 0.1);
+            padding: 1px 6px;
+            border-radius: 10px;
+            font-size: 11px;
+            color: var(--text-secondary);
+        }}
+
+        .filter-chip.active .chip-count {{
+            background: rgba(56, 139, 253, 0.45);
+            color: #ffffff;
+        }}
+
         /* Empty State */
         .empty-state {{
             background: var(--bg-card);
@@ -870,6 +1073,20 @@ class HtmlReporter:
                 <span class="nav-label">策略快速定位:</span>
                 {nav_html}
             </div>
+            <div class="filter-divider"></div>
+            <div class="filter-container">
+                <div class="filter-group">
+                    <span class="filter-label">🏷️ 申万一级行业:</span>
+                    <div class="filter-chips" id="l1ChipsContainer">
+                        {l1_chips_str}
+                    </div>
+                </div>
+                <div class="filter-group" id="l2FilterGroup" style="display: none;">
+                    <span class="filter-label">🔍 二级行业下钻:</span>
+                    <div class="filter-chips" id="l2ChipsContainer">
+                    </div>
+                </div>
+            </div>
         </header>
 
         <!-- Main Content Sections -->
@@ -881,6 +1098,115 @@ class HtmlReporter:
     <!-- Chart Injection Script -->
     <script>
         const chartDataList = {charts_json_str};
+        const industryTree = {industry_tree_json};
+        let currentL1 = "ALL";
+        let currentL2 = "ALL";
+
+        function handleL1Filter(l1Val, btn) {{
+            currentL1 = l1Val;
+            currentL2 = "ALL";
+
+            document.querySelectorAll("#l1ChipsContainer .filter-chip").forEach(c => c.classList.remove("active"));
+            if (btn) btn.classList.add("active");
+
+            const l2Group = document.getElementById("l2FilterGroup");
+            const l2Container = document.getElementById("l2ChipsContainer");
+
+            if (l1Val === "ALL" || !industryTree[l1Val]) {{
+                l2Group.style.display = "none";
+                l2Container.innerHTML = "";
+            }} else {{
+                const subIndustries = industryTree[l1Val];
+                const subEntries = Object.entries(subIndustries).sort((a, b) => b[1] - a[1]);
+                let totalSub = 0;
+                subEntries.forEach(e => totalSub += e[1]);
+
+                let l2Html = `<button type="button" class="filter-chip active" data-level="l2" data-val="ALL" onclick="handleL2Filter('ALL', this)">全部 <span class="chip-count">${{totalSub}}</span></button>`;
+                subEntries.forEach(([l2Name, count]) => {{
+                    l2Html += `<button type="button" class="filter-chip" data-level="l2" data-val="${{l2Name}}" onclick="handleL2Filter('${{l2Name}}', this)">${{l2Name}} <span class="chip-count">${{count}}</span></button>`;
+                }});
+
+                l2Container.innerHTML = l2Html;
+                l2Group.style.display = "flex";
+            }}
+
+            applyFilter();
+        }}
+
+        function handleL2Filter(l2Val, btn) {{
+            currentL2 = l2Val;
+            document.querySelectorAll("#l2ChipsContainer .filter-chip").forEach(c => c.classList.remove("active"));
+            if (btn) btn.classList.add("active");
+            applyFilter();
+        }}
+
+        function applyFilter() {{
+            document.querySelectorAll(".strategy-section").forEach(sec => {{
+                let visibleCount = 0;
+
+                // Stock cards
+                const cards = sec.querySelectorAll(".stock-card");
+                cards.forEach(card => {{
+                    const l1 = card.getAttribute("data-industry-l1");
+                    const l2 = card.getAttribute("data-industry-l2");
+                    const matchL1 = (currentL1 === "ALL" || l1 === currentL1);
+                    const matchL2 = (currentL2 === "ALL" || l2 === currentL2);
+                    if (matchL1 && matchL2) {{
+                        card.style.display = "";
+                        visibleCount++;
+                    }} else {{
+                        card.style.display = "none";
+                    }}
+                }});
+
+                // Event table rows
+                const rows = sec.querySelectorAll(".event-table tbody tr");
+                rows.forEach(row => {{
+                    const l1 = row.getAttribute("data-industry-l1");
+                    const l2 = row.getAttribute("data-industry-l2");
+                    const matchL1 = (currentL1 === "ALL" || l1 === currentL1);
+                    const matchL2 = (currentL2 === "ALL" || l2 === currentL2);
+                    if (matchL1 && matchL2) {{
+                        row.style.display = "";
+                        visibleCount++;
+                    }} else {{
+                        row.style.display = "none";
+                    }}
+                }});
+
+                // Update section hit count badge
+                const countBadge = sec.querySelector(".hit-count");
+                if (countBadge) {{
+                    countBadge.innerText = `${{visibleCount}} 只标的`;
+                }}
+
+                // Show / hide whole strategy section
+                if (visibleCount === 0) {{
+                    sec.style.display = "none";
+                }} else {{
+                    sec.style.display = "";
+                }}
+            }});
+
+            // Trigger resize on visible charts and check lazy render
+            requestAnimationFrame(() => {{
+                activeCharts.forEach(c => {{
+                    try {{ c.resize(); }} catch (e) {{}}
+                }});
+                document.querySelectorAll(".stock-card").forEach(card => {{
+                    if (card.style.display !== "none") {{
+                        const chartDiv = card.querySelector(".chart-container");
+                        if (chartDiv && chartDiv.getAttribute("data-rendered") !== "true") {{
+                            const rect = chartDiv.getBoundingClientRect();
+                            if (rect.top < window.innerHeight + 300) {{
+                                const data = chartDataMap.get(chartDiv.id);
+                                if (data) initStockChart(data);
+                            }}
+                        }}
+                    }}
+                }});
+            }});
+        }}
 
         // Cache chart data by elem_id
         const chartDataMap = new Map();
@@ -903,6 +1229,9 @@ class HtmlReporter:
         document.addEventListener("DOMContentLoaded", () => {{
             if (!window.echarts) {{
                 console.error("ECharts script failed to load.");
+                document.querySelectorAll(".chart-container").forEach(el => {{
+                    el.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#ff7875;font-size:13px;">⚠️ 图表组件未就绪，请检查资源或刷新重试</div>';
+                }});
                 return;
             }}
 
@@ -930,12 +1259,13 @@ class HtmlReporter:
         }});
 
         function initStockChart(data) {{
-            const dom = document.getElementById(data.elem_id);
-            if (!dom || dom.getAttribute("data-rendered") === "true") return;
-            dom.setAttribute("data-rendered", "true");
+            try {{
+                const dom = document.getElementById(data.elem_id);
+                if (!dom || dom.getAttribute("data-rendered") === "true") return;
+                dom.setAttribute("data-rendered", "true");
 
-            const myChart = echarts.init(dom, "dark");
-            activeCharts.push(myChart);
+                const myChart = echarts.init(dom, "dark");
+                activeCharts.push(myChart);
             const dates = data.dates;
             const kValues = data.k_values;
             const volumes = data.volumes;
@@ -1277,6 +1607,9 @@ class HtmlReporter:
             }};
 
             myChart.setOption(option);
+            }} catch (err) {{
+                console.error("渲染股票图表失败:", data ? data.symbol : "未知", err);
+            }}
         }}
     </script>
 </body>

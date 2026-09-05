@@ -52,6 +52,9 @@ def main() -> None:
         # 3. 初始化数据引擎
         engine = DataEngine(settings)
 
+        # Synchronize stock basic metadata (symbols & Shenwan industry classification)
+        engine.sync_stock_basic()
+
         if args.backfill:
             # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
             logger.info("进入回填模式...")

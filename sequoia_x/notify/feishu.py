@@ -38,18 +38,49 @@ class FeishuNotifier:
         return f"SZ{code}"
 
     @staticmethod
-    def _get_stock_names(symbols: list[str]) -> dict[str, str]:
-        """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
-        import baostock as bs
-        bs.login()
-        mapping = {}
-        for code in symbols:
-            prefix = "sh" if code.startswith(("6", "9")) else "sz"
-            rs = bs.query_stock_basic(code=f"{prefix}.{code}")
-            while rs.next():
-                row = rs.get_row_data()
-                mapping[code] = row[1]  # 第2个字段是股票名称
-        bs.logout()
+    def _get_stock_names(symbols: list[str], db_path: str = "data/sequoia_v2.db") -> dict[str, str]:
+        """批量查询股票名称，优先从本地 stock_basic 表查询，未命中时回退至 baostock。"""
+        mapping: dict[str, str] = {}
+        if not symbols:
+            return mapping
+
+        # 1. 优先从本地 stock_basic 表读取
+        try:
+            import sqlite3
+            from pathlib import Path
+            if Path(db_path).exists():
+                with sqlite3.connect(db_path) as conn:
+                    placeholders = ",".join(["?"] * len(symbols))
+                    rows = conn.execute(
+                        f"SELECT symbol, name FROM stock_basic WHERE symbol IN ({placeholders})",
+                        symbols,
+                    ).fetchall()
+                    mapping = {r[0]: r[1] for r in rows if r[1]}
+        except Exception as exc:
+            logger.debug(f"从 stock_basic 查询股票名称失败: {exc}")
+
+        missing = [s for s in symbols if s not in mapping]
+        if not missing:
+            return mapping
+
+        # 2. 未命中的股票回退到 baostock 查询
+        try:
+            import contextlib
+            import io
+            import baostock as bs
+            with contextlib.redirect_stdout(io.StringIO()):
+                lg = bs.login()
+                if lg.error_code == "0":
+                    for code in missing:
+                        prefix = "sh" if code.startswith(("6", "9")) else "sz"
+                        rs = bs.query_stock_basic(code=f"{prefix}.{code}")
+                        while rs.next():
+                            row = rs.get_row_data()
+                            mapping[code] = row[1]
+                    bs.logout()
+        except Exception as exc:
+            logger.warning(f"baostock 查询股票名称失败: {exc}")
+
         return mapping
 
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:

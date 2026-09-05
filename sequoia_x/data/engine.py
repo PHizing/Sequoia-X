@@ -30,6 +30,21 @@ _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
+_CREATE_BASIC_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS stock_basic (
+    symbol       TEXT PRIMARY KEY,
+    code         TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    industry_l1  TEXT,
+    industry_l2  TEXT,
+    updated_at   TEXT
+);
+"""
+
+_CREATE_BASIC_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_stock_basic_ind ON stock_basic (industry_l1, industry_l2);
+"""
+
 
 def _bs_fetch_batch(tasks: list) -> list:
     """多进程 worker：设置 socket 超时，静默 login/logout，批量拉取 baostock 数据。"""
@@ -80,15 +95,24 @@ class DataEngine:
     """行情数据引擎，负责 SQLite 存储和 baostock 数据同步。"""
 
     def __init__(self, settings: Settings) -> None:
-        self.db_path: str = settings.db_path
+        db_p = Path(settings.db_path)
+        if not db_p.is_absolute():
+            project_root = Path(__file__).resolve().parent.parent.parent
+            db_p = project_root / db_p
+        self.db_path: str = str(db_p.resolve())
         self.start_date: str = settings.start_date
+        self._basic_cache: dict[str, dict[str, str]] | None = None
         self._init_db()
 
     def _init_db(self) -> None:
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        db_dir = Path(self.db_path).parent
+        if not db_dir.exists():
+            db_dir.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
+            conn.execute(_CREATE_BASIC_TABLE_SQL)
+            conn.execute(_CREATE_BASIC_INDEX_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -151,30 +175,159 @@ class DataEngine:
 
     # ── 数据同步 ──
 
+    def sync_stock_basic(self, force: bool = False) -> int:
+        """从 baostock / 申万行业分类服务同步股票基础信息与行业分类至 SQLite stock_basic 表。"""
+        from datetime import date
+        from sequoia_x.data.sw_industry import ShenwanIndustryService
+
+        today_str = date.today().strftime("%Y-%m-%d")
+
+        # 检查是否已有基础数据
+        with sqlite3.connect(self.db_path) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM stock_basic").fetchone()[0]
+
+        if count > 0 and not force:
+            logger.info(f"本地 stock_basic 已收录 {count} 只股票，跳过基础表同步")
+            return count
+
+        logger.info("开始同步全市场股票基础信息与申万一二级行业分类...")
+        import contextlib
+        import io
+        import socket
+        socket.setdefaulttimeout(15.0)
+        import baostock as bs
+
+        records = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                lg = bs.login()
+                if lg.error_code == "0":
+                    rs = bs.query_stock_basic(code_name="", code="")
+                    while rs.next():
+                        row = rs.get_row_data()
+                        code = row[0]        # e.g. "sh.600000"
+                        name = row[1]        # e.g. "浦发银行"
+                        status = row[4]      # "1" = Listed
+                        stock_type = row[5]  # "1" = Stock
+                        if status == "1" and stock_type == "1":
+                            sym = code.split(".")[1]
+                            l1, l2 = ShenwanIndustryService.get_industry(sym)
+                            records.append((sym, code, name, l1, l2, today_str))
+            except Exception as exc:
+                logger.warning(f"baostock 同步股票基础信息异常: {exc}")
+            finally:
+                try:
+                    bs.logout()
+                except Exception:
+                    pass
+
+        # 3. 若 baostock 失败，通过 akshare 兜底
+        if not records:
+            logger.warning("baostock 获取股票列表失败，尝试通过 akshare 兜底同步 stock_basic...")
+            try:
+                import akshare as ak
+                stock_info = ak.stock_info_a_code_name()
+                if stock_info is not None and not stock_info.empty:
+                    for _, row in stock_info.iterrows():
+                        sym = str(row["code"]).zfill(6)
+                        name = str(row["name"])
+                        code = self._to_baostock_code(sym)
+                        l1, l2 = ShenwanIndustryService.get_industry(sym)
+                        records.append((sym, code, name, l1, l2, today_str))
+            except Exception as e_ak:
+                logger.error(f"akshare 兜底获取股票基础信息失败: {e_ak}")
+
+        if records:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO stock_basic (symbol, code, name, industry_l1, industry_l2, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                        code = excluded.code,
+                        name = excluded.name,
+                        industry_l1 = excluded.industry_l1,
+                        industry_l2 = excluded.industry_l2,
+                        updated_at = excluded.updated_at
+                    """,
+                    records,
+                )
+                conn.commit()
+            logger.info(f"stock_basic 基础信息同步完成，写入/更新 {len(records)} 只股票")
+            self._basic_cache = None
+            return len(records)
+
+        return 0
+
+    def get_stock_basic_map(self) -> dict[str, dict[str, str]]:
+        """获取所有股票的基础信息映射字典：{symbol: {"name": ..., "industry_l1": ..., "industry_l2": ...}}。"""
+        if self._basic_cache:
+            return self._basic_cache
+
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT symbol, name, industry_l1, industry_l2 FROM stock_basic"
+            ).fetchall()
+
+        if not rows:
+            self.sync_stock_basic()
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT symbol, name, industry_l1, industry_l2 FROM stock_basic"
+                ).fetchall()
+
+        mapping = {
+            r[0]: {
+                "name": r[1],
+                "industry_l1": r[2] or "其他",
+                "industry_l2": r[3] or "其他",
+            }
+            for r in rows
+        }
+        self._basic_cache = mapping
+        return mapping
+
     def sync_today_bulk(self) -> int:
-        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
+        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。
+        
+        自动对比 stock_basic 与 stock_daily：
+        - 已有股票：增量同步自最新日期后的数据；
+        - 新上市或本地缺失股票：自动从 start_date 拉取数据补齐。
+        """
         from datetime import date, timedelta
         from multiprocessing import Pool
 
         today = date.today()
         today_str = today.strftime("%Y-%m-%d")
 
+        # 确保基础信息表已同步，获取全市场股票
+        self.sync_stock_basic()
+
         tasks = []
         with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
+            daily_rows = conn.execute(
                 "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
             ).fetchall()
+            basic_symbols = [
+                r[0] for r in conn.execute("SELECT symbol FROM stock_basic ORDER BY symbol").fetchall()
+            ]
 
-        if not rows:
+        if not daily_rows and not basic_symbols:
             logger.warning("本地无股票数据，请先执行 --backfill")
             return 0
 
-        for symbol, last_date in rows:
+        daily_map = dict(daily_rows)
+        all_target_symbols = basic_symbols if basic_symbols else list(daily_map.keys())
+
+        for symbol in all_target_symbols:
+            last_date = daily_map.get(symbol)
             if last_date and last_date >= today_str:
                 continue
-            start = today_str
             if last_date:
                 start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
+            else:
+                # 新股票或未入库股票，从配置的起始日期开始同步
+                start = self.start_date
             tasks.append((symbol, self._to_baostock_code(symbol), start, today_str))
 
         if not tasks:
@@ -182,7 +335,7 @@ class DataEngine:
             return 0
 
         # 计算本地市场最新收盘日期
-        max_dates = [last_date for _, last_date in rows if last_date]
+        max_dates = [last_date for _, last_date in daily_rows if last_date]
         market_latest_date = max(max_dates) if max_dates else None
 
         # 如果今天是周末，计算最近的周五
@@ -193,8 +346,9 @@ class DataEngine:
         else:
             last_trading_day = today_str
 
-        # 1. 若当前是周末且本地已包含最近周五的数据，则无需重复同步
-        if today.weekday() >= 5 and market_latest_date and market_latest_date >= last_trading_day:
+        # 1. 若当前是周末且本地已有股票收录最近周五的数据，且没有新增待补新股票，则无需重复同步
+        has_new_stocks = any(symbol not in daily_map for symbol, _, _, _ in tasks)
+        if not has_new_stocks and today.weekday() >= 5 and market_latest_date and market_latest_date >= last_trading_day:
             logger.info(f"今日 ({today_str}) 为周末休市日，本地已收录周五最新数据 ({market_latest_date})，无需增量同步")
             return 0
 
@@ -440,7 +594,23 @@ class DataEngine:
     # ── 股票列表 ──
 
     def get_all_symbols(self) -> list[str]:
-        """获取全市场 A 股代码列表（baostock 优先并带重试，akshare 兜底）。"""
+        """获取全市场 A 股代码列表（优先读取本地 stock_basic，未就绪则自动同步）。"""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT symbol FROM stock_basic ORDER BY symbol"
+            ).fetchall()
+        if rows:
+            return [row[0] for row in rows]
+
+        # 尝试自动同步 stock_basic
+        self.sync_stock_basic()
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT symbol FROM stock_basic ORDER BY symbol"
+            ).fetchall()
+        if rows:
+            return [row[0] for row in rows]
+
         import socket
         socket.setdefaulttimeout(15.0)
         import time
