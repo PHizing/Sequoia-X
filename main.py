@@ -115,7 +115,11 @@ def main() -> None:
 
             selected: list[str] = strategy.run()
             strategy_results[strategy_name] = selected
-            logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
+            if selected:
+                sample = ", ".join(selected[:8]) + ("..." if len(selected) > 8 else "")
+                logger.info(f"{strategy_name} 选出 {len(selected)} 只股票: [{sample}]")
+            else:
+                logger.info(f"{strategy_name} 选出 0 只股票")
 
             if selected:
                 notifier.send(
@@ -131,6 +135,14 @@ def main() -> None:
         reporter = HtmlReporter(engine=engine, settings=settings)
         report_path = reporter.generate(strategy_results)
         logger.info(f"选股走势报告已生成：{report_path}")
+
+        # 7. 自动调用系统默认浏览器打开可视化走势报告
+        try:
+            import webbrowser
+            webbrowser.open(report_path.as_uri())
+            logger.info("已尝试在默认浏览器中打开选股走势报告")
+        except Exception as e:
+            logger.debug(f"自动打开浏览器失败: {e}")
 
     except Exception:
         try:

@@ -146,6 +146,10 @@ class FeishuNotifier:
             不抛出异常，HTTP 失败时记录 ERROR 日志。
         """
         url = self.settings.get_webhook_url(webhook_key)
+        if not url or "your-" in url or "open.feishu.cn" not in url:
+            logger.info(f"飞书 Webhook 未配置或为默认占位符，跳过推送 [{webhook_key}]")
+            return
+
         payload = self._build_card(symbols, strategy_name)
 
         try:
