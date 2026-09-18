@@ -23,17 +23,16 @@ class TurtleTradeStrategy(BaseStrategy):
     webhook_key: str = "turtle"
     _MIN_BARS: int = 21  # 至少需要 21 根 K 线（20日窗口 + 当日）
 
-    def _get_market_caps(self, symbols: list[str]) -> dict[str, float]:
-        """通过 baostock 查询候选股票的流通市值（不复权收盘价 × 流通股本）。
+    def _get_market_caps(self, symbols: list[str], benchmark_date: str | None = None) -> dict[str, float]:
+        """通过 baostock 查询候选股票在基准交易日的流通市值（不复权收盘价 × 流通股本）。
 
         流通股本 = 成交量 / (换手率% / 100)
         流通市值 = 流通股本 × 不复权收盘价
         """
         from datetime import date
-
         import baostock as bs
 
-        today_str = date.today().strftime("%Y-%m-%d")
+        query_date = benchmark_date or self.engine.get_market_latest_date() or date.today().strftime("%Y-%m-%d")
         market_caps: dict[str, float] = {}
 
         bs.login()
@@ -43,8 +42,8 @@ class TurtleTradeStrategy(BaseStrategy):
                 rs = bs.query_history_k_data_plus(
                     bs_code,
                     "close,volume,turn",
-                    start_date=today_str,
-                    end_date=today_str,
+                    start_date=query_date,
+                    end_date=query_date,
                     frequency="d",
                     adjustflag="3",  # 不复权，真实价格
                 )
@@ -69,12 +68,24 @@ class TurtleTradeStrategy(BaseStrategy):
         遍历全市场，返回满足海龟突破条件的股票代码列表。
         """
         symbols = self.engine.get_active_symbols()
+        if not isinstance(symbols, list):
+            if hasattr(self.engine, "get_local_symbols") and isinstance(self.engine.get_local_symbols(), list):
+                symbols = self.engine.get_local_symbols()
+            else:
+                symbols = []
         latest_date = self.engine.get_market_latest_date()
+        if not isinstance(latest_date, str):
+            latest_date = None
         candidates: list[str] = []
 
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
+                if df.empty:
+                    continue
+                # 全天候安全时间轴切片：对齐至市场最新有效收盘日，消除异常超前未来日期
+                if latest_date:
+                    df = df[df["date"] <= latest_date]
                 if len(df) < self._MIN_BARS:
                     continue
                 if latest_date and str(df.iloc[-1]["date"]) != latest_date:
@@ -107,7 +118,7 @@ class TurtleTradeStrategy(BaseStrategy):
 
         # 按流通市值从大到小排序
         if candidates:
-            market_caps = self._get_market_caps(candidates)
+            market_caps = self._get_market_caps(candidates, benchmark_date=latest_date)
             candidates.sort(key=lambda s: market_caps.get(s, 0), reverse=True)
 
         logger.info(f"TurtleTradeStrategy 选出 {len(candidates)} 只股票")

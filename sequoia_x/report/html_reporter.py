@@ -360,11 +360,14 @@ class HtmlReporter:
                         "count": len(charts),
                     })
 
+        benchmark_date = self.engine.get_market_latest_date() or date.today().strftime("%Y-%m-%d")
+
         # Render HTML
         html_content = self._render_template(
             technical_sections=technical_sections,
             event_sections=event_sections,
             total_hits=total_hits,
+            benchmark_date=benchmark_date,
         )
 
         today_str = date.today().strftime("%Y%m%d")
@@ -382,10 +385,12 @@ class HtmlReporter:
         technical_sections: list[dict[str, Any]],
         event_sections: list[dict[str, Any]],
         total_hits: int,
+        benchmark_date: str = "",
     ) -> str:
         """Assemble complete modern dark-themed HTML document with embedded ECharts."""
         generated_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         db_path = self.settings.db_path
+        display_date = benchmark_date or date.today().strftime("%Y-%m-%d")
 
         # Inline local bundled ECharts if available for 100% self-contained offline reports
         echarts_script_tag = ""
@@ -609,7 +614,7 @@ class HtmlReporter:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sequoia-X 量化突破走势图报告 | {date.today().strftime('%Y-%m-%d')}</title>
+    <title>Sequoia-X 量化突破走势图报告 | 基准日 {display_date}</title>
     <!-- Apache ECharts -->
     {echarts_script_tag}
     <style>
@@ -1064,6 +1069,7 @@ class HtmlReporter:
                     <span class="brand-tag">V2 Pro</span>
                 </div>
                 <div class="meta-info">
+                    <span>行情基准日: <strong style="color:var(--color-gold);">{display_date}</strong> (收盘)</span> |
                     <span>生成时间: {generated_time}</span> | 
                     <span>命中总标的: <strong style="color:var(--color-accent);">{total_hits}</strong> 只</span> |
                     <span>数据库: <code>{db_path}</code></span>

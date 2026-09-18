@@ -93,7 +93,13 @@ def main() -> None:
         count = engine.sync_today_bulk()
         logger.info(f"快照同步完成，写入 {count} 条日K行情")
 
-        # 4. 策略列表（新增策略在此追加即可）
+        # 4. 获取并宣布量化行情基准日
+        benchmark_date = engine.get_market_latest_date()
+        logger.info("=" * 50)
+        logger.info(f"【行情基准日】当前锁定有效量化收盘基准日: {benchmark_date}")
+        logger.info("=" * 50)
+
+        # 策略列表（新增策略在此追加即可）
         strategies: list[BaseStrategy] = [
             MaVolumeStrategy(engine=engine, settings=settings),
             TurtleTradeStrategy(engine=engine, settings=settings),

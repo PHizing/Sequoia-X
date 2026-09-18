@@ -29,12 +29,24 @@ class MaVolumeStrategy(BaseStrategy):
             满足条件的股票代码列表。
         """
         symbols = self.engine.get_active_symbols()
+        if not isinstance(symbols, list):
+            if hasattr(self.engine, "get_local_symbols") and isinstance(self.engine.get_local_symbols(), list):
+                symbols = self.engine.get_local_symbols()
+            else:
+                symbols = []
         latest_date = self.engine.get_market_latest_date()
+        if not isinstance(latest_date, str):
+            latest_date = None
         selected: list[str] = []
 
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
+                if df.empty:
+                    continue
+                # 全天候安全时间轴切片：对齐至市场最新有效收盘日，消除异常超前未来日期
+                if latest_date:
+                    df = df[df["date"] <= latest_date]
                 if len(df) < 20:
                     continue
                 if latest_date and str(df.iloc[-1]["date"]) != latest_date:

@@ -79,7 +79,7 @@ def _bs_fetch_batch(tasks: list) -> list:
                         start_date=start,
                         end_date=end,
                         frequency="d",
-                        adjustflag="1",  # 后复权
+                        adjustflag="2",  # 前复权（与招商证券/同花顺/TradingView实盘价格严格对齐）
                     )
                     if rs.error_code != "0":
                         continue
@@ -349,31 +349,77 @@ class DataEngine:
         return [row[0] for row in rows]
 
     def get_market_latest_date(self) -> str | None:
-        """获取本地数据库中在市股票的最新收盘交易日期。"""
+        """获取本地数据库中在市股票的有效最新收盘交易日期（安全基准日）。
+
+        具备全天候时钟感知与防脏数据单点污染机制：
+        1. 排除大于当前物理有效收盘时间的未来/未完结日期；
+        2. 排除极少数股票孤立领先的离群脏数据（要求该日期至少覆盖可观比例的样本股票）；
+        3. 无论盘前、盘中、盘后或周末运行，均能稳定返回真实已完结的行情基准日。
+        """
+        from datetime import datetime, date, timedelta
+        now = datetime.now()
+        today = date.today()
+        today_str = today.strftime("%Y-%m-%d")
+
+        # 若当前是周一至周五且在 15:30 之前，今日日K尚未收盘结算，有效收盘日最晚只能是上一工作日
+        if today.weekday() < 5 and (now.hour < 15 or (now.hour == 15 and now.minute < 30)):
+            prev_days = 3 if today.weekday() == 0 else 1
+            max_allowed_date = (today - timedelta(days=prev_days)).strftime("%Y-%m-%d")
+        else:
+            max_allowed_date = today_str
+
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
+            # 查询符合时间上限的最晚5个交易日及其在市股票覆盖量
+            rows = conn.execute(
                 """
-                SELECT MAX(d.date)
+                SELECT d.date, COUNT(DISTINCT d.symbol) as cnt
                 FROM stock_daily d
                 JOIN stock_basic b ON d.symbol = b.symbol
-                WHERE b.status = 1
-                """
-            ).fetchone()
-            if row and row[0]:
-                return row[0]
-            # 降级直接从 stock_daily 获取
-            row2 = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()
-            return row2[0] if row2 and row2[0] else None
+                WHERE b.status = 1 AND d.date <= ?
+                GROUP BY d.date
+                ORDER BY d.date DESC
+                LIMIT 5
+                """,
+                (max_allowed_date,),
+            ).fetchall()
+
+            if not rows:
+                # 降级：直接从 stock_daily 查（不带 status=1 过滤）
+                rows = conn.execute(
+                    """
+                    SELECT date, COUNT(DISTINCT symbol) as cnt
+                    FROM stock_daily
+                    WHERE date <= ?
+                    GROUP BY date
+                    ORDER BY date DESC
+                    LIMIT 5
+                    """,
+                    (max_allowed_date,),
+                ).fetchall()
+
+            if not rows:
+                # 再次降级：如果本地所有记录日期都在未来（极端情况），返回绝对最大
+                row = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()
+                return row[0] if row and row[0] else None
+
+            # 寻找满足覆盖率要求的最新有效收盘日（避免只有 1~2 只股票的孤立离群点）
+            max_cnt = max(r[1] for r in rows)
+            for d_date, cnt in rows:
+                if cnt >= max(3, int(max_cnt * 0.3)):
+                    return d_date
+
+            return rows[0][0]
 
     def sync_today_bulk(self) -> int:
-        """多进程并行通过 baostock 拉取在市股票增量数据（后复权），安全写入 SQLite。
+        """多进程并行通过 baostock 拉取在市股票增量数据（前复权），安全写入 SQLite。
         
         仅拉取在市股票 (status = 1)，彻底排除退市股票。
         使用 INSERT OR REPLACE 针对 (symbol, date) 进行幂等追加，绝不删除历史日K线。
         """
-        from datetime import date, timedelta
+        from datetime import datetime, date, timedelta
         from multiprocessing import Pool
 
+        now = datetime.now()
         today = date.today()
         today_str = today.strftime("%Y-%m-%d")
 
@@ -384,6 +430,20 @@ class DataEngine:
         if not target_symbols:
             logger.warning("在市股票列表为空，请先执行基础数据同步")
             return 0
+
+        # 计算本地市场在市股票最新收盘日期
+        market_latest_date = self.get_market_latest_date()
+
+        # 0. 全天候时效守护：工作日早盘（9:30前）或盘中未到 15:30 收盘清算时间
+        if today.weekday() < 5 and (now.hour < 15 or (now.hour == 15 and now.minute < 30)):
+            prev_workday = (today - timedelta(days=3 if today.weekday() == 0 else 1)).strftime("%Y-%m-%d")
+            # 只要本地已具备上一交易日收盘数据，盘前/盘中直接复用，不发起未收盘的日线拉取
+            if market_latest_date and market_latest_date >= prev_workday:
+                logger.info(
+                    f"[全天候运行守护] 当前处于盘前/盘中交易时段（未收盘结算），"
+                    f"交易所尚未发布今日完整日K。自动锁定使用上一交易日已收盘数据 ({market_latest_date}) 执行选股"
+                )
+                return 0
 
         with sqlite3.connect(self.db_path) as conn:
             daily_rows = conn.execute(
@@ -408,9 +468,6 @@ class DataEngine:
             logger.info("所有在市股票已是最新，无需更新")
             return 0
 
-        # 计算本地市场在市股票最新收盘日期
-        market_latest_date = self.get_market_latest_date()
-
         # 如果今天是周末，计算最近的周五
         if today.weekday() == 5:
             last_trading_day = (today - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -425,7 +482,7 @@ class DataEngine:
             logger.info(f"今日 ({today_str}) 为周末休市日，本地已收录周五最新数据 ({market_latest_date})，无需增量同步")
             return 0
 
-        # 2. 若是工作日且本地已具备上一交易日数据，快速探测今日收盘K线是否已就绪
+        # 2. 若是工作日收盘后且本地已具备上一交易日数据，快速探测今日收盘K线是否已就绪
         prev_workday = (today - timedelta(days=3 if today.weekday() == 0 else 1)).strftime("%Y-%m-%d")
         if market_latest_date and market_latest_date >= prev_workday:
             if not self._probe_date_has_data(today_str):
@@ -489,7 +546,7 @@ class DataEngine:
         return count
 
     def backfill(self, symbols: list[str]) -> None:
-        """通过 baostock 批量回填历史日 K 线数据（后复权）。
+        """通过 baostock 批量回填历史日 K 线数据（前复权）。
 
         容错机制：
         - 单只股票失败自动重试 3 次，间隔递增（2s/4s/8s）
@@ -610,7 +667,7 @@ class DataEngine:
                             start_date=start,
                             end_date=today_str,
                             frequency="d",
-                            adjustflag="1",  # 后复权
+                            adjustflag="2",  # 前复权（与招商证券/同花顺/TradingView实盘价格严格对齐）
                         )
 
                         if rs.error_code != "0":

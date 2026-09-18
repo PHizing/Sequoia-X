@@ -44,8 +44,15 @@ class PrivatePlacementStrategy(BaseStrategy):
             return []
 
         # 按发行日期过滤：只保留最近 N 天内的公告
-        today = date.today()
-        cutoff = today - timedelta(days=self._LOOKBACK_DAYS)
+        benchmark_date = self.engine.get_market_latest_date()
+        if benchmark_date:
+            try:
+                base_date = date.fromisoformat(benchmark_date)
+            except Exception:
+                base_date = date.today()
+        else:
+            base_date = date.today()
+        cutoff = base_date - timedelta(days=self._LOOKBACK_DAYS)
 
         df["发行日期"] = pd.to_datetime(df["发行日期"], errors="coerce")
         df = df.dropna(subset=["发行日期"])

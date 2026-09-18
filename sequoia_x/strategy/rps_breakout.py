@@ -25,13 +25,28 @@ class RpsBreakoutStrategy(BaseStrategy):
             return []
 
         df['date'] = pd.to_datetime(df['date'])
+
+        # 全天候安全时间轴切片：对齐至市场最新有效收盘日，消除异常超前未来日期
+        benchmark_date = self.engine.get_market_latest_date()
+        if not isinstance(benchmark_date, str):
+            benchmark_date = None
+
+        if benchmark_date:
+            target_ts = pd.to_datetime(benchmark_date)
+            df = df[df['date'] <= target_ts]
+            latest_date = target_ts
+        else:
+            latest_date = df['date'].max()
+
+        if df.empty:
+            return []
+
         df = df.sort_values(['symbol', 'date'])
 
         # 纵向计算涨幅
         df['close_shift'] = df.groupby('symbol')['close'].shift(self.rps_period)
         df['pct_change'] = (df['close'] - df['close_shift']) / df['close_shift']
 
-        latest_date = df['date'].max()
         latest_df = df[df['date'] == latest_date].copy()
         latest_df = latest_df.dropna(subset=['pct_change'])
 
